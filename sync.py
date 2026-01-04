@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SST (海水面温度) 日次自動更新スクリプト - GitHub Actions版
+SST (海水面温度) 日次自動更新スクリプト
 
 NASA MUR SST データを取得し、Supabase sst_daily テーブルにアップロード。
 
@@ -8,7 +8,7 @@ NASA MUR SST データを取得し、Supabase sst_daily テーブルにアップ
   python sync.py              # 日次更新（差分取得）
   python sync.py --full       # 全期間一括（2002〜）
   python sync.py --dry-run    # 確認のみ
-  python sync.py --site manza # 特定サイトのみ
+  python sync.py --site sesoko  # 特定サイトのみ
 """
 
 import argparse
@@ -20,14 +20,31 @@ import ssl
 import urllib.request
 import logging
 from datetime import datetime, timezone, timedelta
-
-import requests
+from pathlib import Path
 
 # =============================================================================
 # 設定
 # =============================================================================
 
-# 環境変数（GitHub Secrets から取得）
+SCRIPT_DIR = Path(__file__).parent
+ENV_PATH = SCRIPT_DIR / ".env"
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+STATE_PATH = SCRIPT_DIR / "sync_state.json"
+LOG_PATH = SCRIPT_DIR / "sync.log"
+
+def load_dotenv():
+    """シンプルな.envファイル読み込み"""
+    if ENV_PATH.exists():
+        with open(ENV_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+
+load_dotenv()
+
+# 環境変数
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -44,11 +61,15 @@ SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 # NASAデータの遅延日数（2-3日）
 DATA_DELAY_DAYS = 3
 
-# 取得対象サイト（万座 → 瀬底 → 小笠原 の順）
+# 取得対象サイト（7地点）
 SITES = [
-    {"code": "manza", "name": "万座", "lat": 26.5080, "lon": 127.8540, "mmm": 29.0},
     {"code": "sesoko", "name": "瀬底", "lat": 26.6494, "lon": 127.8536, "mmm": 29.0},
+    {"code": "manza", "name": "万座", "lat": 26.5080, "lon": 127.8540, "mmm": 29.0},
+    {"code": "kerama", "name": "慶良間", "lat": 26.186, "lon": 127.374, "mmm": 29.0},
+    {"code": "sekisei", "name": "石西礁湖", "lat": 24.337, "lon": 124.035, "mmm": 29.5},
+    {"code": "amami", "name": "奄美", "lat": 28.105, "lon": 129.160, "mmm": 29.0},
     {"code": "ogasawara", "name": "小笠原", "lat": 27.0942, "lon": 142.1919, "mmm": 28.5},
+    {"code": "kushimoto", "name": "串本", "lat": 33.470, "lon": 135.696, "mmm": 28.0},
 ]
 
 # 全期間取得時の開始日
@@ -65,12 +86,33 @@ TIMEOUT = 120
 # ロギング
 # =============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_PATH, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+# =============================================================================
+# ステート管理
+# =============================================================================
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        with open(STATE_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"last_sync": None, "sites": {}}
+
+def save_state(state: dict):
+    state["last_sync"] = datetime.now().isoformat()
+    with open(STATE_PATH, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
 # =============================================================================
 # ユーティリティ
@@ -96,6 +138,7 @@ def send_telegram(message, is_error=False):
         return False
     
     try:
+        import requests
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         resp = requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -110,6 +153,8 @@ def send_telegram(message, is_error=False):
 
 def supabase_get(endpoint, params=None):
     """Supabase REST API GET"""
+    import requests
+    
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -123,6 +168,8 @@ def supabase_get(endpoint, params=None):
 
 def supabase_upsert(endpoint, data, batch_size=100):
     """Supabase REST API UPSERT"""
+    import requests
+    
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -285,7 +332,7 @@ def build_telegram_message(results, total_count, elapsed, errors):
         "━━━━━━━━━━━━━━━"
     ]
     
-    # 各サイトの最新SST（万座 → 瀬底 → 小笠原 の順）
+    # 各サイトの最新SST
     for site in SITES:
         latest = get_latest_sst(site["code"])
         if latest:
@@ -315,7 +362,7 @@ def build_telegram_message(results, total_count, elapsed, errors):
 
 def main():
     parser = argparse.ArgumentParser(description='NASA MUR SST 日次更新')
-    parser.add_argument('--site', type=str, help='特定サイトのみ (manza/sesoko/ogasawara)')
+    parser.add_argument('--site', type=str, help='特定サイトのみ (sesoko/manza/ogasawara等)')
     parser.add_argument('--full', action='store_true', help='全期間一括（2002〜）')
     parser.add_argument('--dry-run', action='store_true', help='確認のみ')
     parser.add_argument('--force', action='store_true', help='強制再取得')
@@ -330,6 +377,7 @@ def main():
     
     start_time = time.time()
     now = datetime.now(UTC)
+    state = load_state()
     
     # NASAデータの遅延を考慮した終了日
     end_date = (now - timedelta(days=DATA_DELAY_DAYS)).strftime("%Y-%m-%d")
@@ -379,6 +427,7 @@ def main():
     if not site_ranges:
         logger.info("全サイト最新です")
         if not args.dry_run:
+            save_state(state)
             msg = build_telegram_message([], 0, 0, [])
             send_telegram(msg)
         logger.info("=" * 60)
@@ -426,6 +475,12 @@ def main():
                 logger.info(f"  ✅ {uploaded}件 upsert")
                 total += uploaded
                 results.append({"site": code, "count": uploaded, "status": "ok"})
+                
+                # ステート更新
+                state["sites"][code] = {
+                    "last_date": sst_data[-1]["date"],
+                    "last_sst": sst_data[-1]["sst"]
+                }
             else:
                 logger.warning(f"  データなし")
                 results.append({"site": code, "count": 0, "status": "no_data"})
@@ -438,6 +493,9 @@ def main():
         time.sleep(1)  # API負荷軽減
     
     elapsed = time.time() - start_time
+    
+    # ステート保存
+    save_state(state)
     
     logger.info(f"完了: 合計 {total}件 ({elapsed:.1f}秒)")
     logger.info("=" * 60)
